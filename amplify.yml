@@ -1,0 +1,29 @@
+# Build de AWS Amplify Hosting (monorepo: el frontend vive en /frontend).
+# Una sola app de Amplify con tres ramas conectadas:
+#   develop -> DEV   |   qa -> QA   |   main -> PDN
+# Variables por rama (Amplify > Hosting > Environment variables):
+#   VITE_API_URL  URL HTTPS de la API del mismo ambiente (App Runner)
+#   VITE_APP_ENV  DEV | QA | PDN
+#   AMPLIFY_MONOREPO_APP_ROOT=frontend (la agrega Amplify al marcar "monorepo")
+# Si `npm test` falla, el build se detiene y la rama no se publica.
+version: 1
+applications:
+  - appRoot: frontend
+    frontend:
+      phases:
+        preBuild:
+          commands:
+            - nvm use 20 || true
+            - npm ci
+        build:
+          commands:
+            - test -n "$VITE_API_URL" || (echo "Falta VITE_API_URL para la rama $AWS_BRANCH" && exit 1)
+            - npm test
+            - npm run build
+      artifacts:
+        baseDirectory: dist
+        files:
+          - '**/*'
+      cache:
+        paths:
+          - node_modules/**/*

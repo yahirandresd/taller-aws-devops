@@ -7,6 +7,7 @@ import {
 } from 'lucide-react'
 
 const API = (import.meta.env.VITE_API_URL || 'http://localhost:8080').replace(/\/$/, '')
+const APP_ENV = (import.meta.env.VITE_APP_ENV || 'LOCAL').toUpperCase()
 const today = new Date().toISOString().slice(0, 10)
 const sectors = ['Centro', 'Chipre', 'Palogrande', 'La Enea', 'Villamaría - referencia', 'Sector de prueba']
 const navItems = [
@@ -126,7 +127,7 @@ export default function App() {
         <button className="mobile-menu icon-button" onClick={() => setMobileNav(!mobileNav)} aria-label="Abrir menú"><Menu size={20}/></button>
         <div className="breadcrumb">Observatorio <span>/</span> {currentNav.label}</div>
         <div className="top-actions">
-          <span className="env-badge"><span /> AMBIENTE CONFIGURABLE</span>
+          <span className="env-badge" data-env={APP_ENV}><span /> AMBIENTE {APP_ENV}</span>
           <button className="icon-button" onClick={loadData} title="Actualizar datos" aria-label="Actualizar datos"><RefreshCw size={17} className={loading ? 'spin' : ''}/></button>
         </div>
       </header>
