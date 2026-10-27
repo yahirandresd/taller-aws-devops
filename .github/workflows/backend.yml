@@ -1,0 +1,136 @@
+# Pipeline del API (Spring Boot) por ambiente:
+#   develop -> DEV  |  qa -> QA  |  main -> PDN (requiere aprobación en el environment "production")
+# Pull requests: solo pruebas y empaquetado, no despliegan.
+# Rollback: Actions > Backend CI/CD > Run workflow, con image_tag = <env>-<sha> de una versión anterior.
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [develop, qa, main]
+    paths: ['backend/**', 'scripts/smoke-test.sh', '.github/workflows/backend.yml']
+  pull_request:
+    branches: [develop, qa, main]
+    paths: ['backend/**', '.github/workflows/backend.yml']
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Rollback: tag existente en ECR a redesplegar (ej. dev-1a2b3c4). Vacío = construir la rama.'
+        required: false
+
+permissions:
+  id-token: write   # OIDC hacia AWS, sin access keys
+  contents: read
+
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REPOSITORY: observatorio-api
+
+jobs:
+  test:
+    name: Pruebas y empaquetado
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Pruebas (JUnit + MockMvc + H2)
+        run: mvn -B test
+      - name: Empaquetar JAR
+        run: mvn -B -DskipTests package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: observatorio-api-jar
+          path: backend/target/*.jar
+          retention-days: 7
+
+  deploy:
+    name: Desplegar ${{ github.ref_name }}
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.ref_name == 'main' && 'production' || github.ref_name == 'qa' && 'qa' || 'development' }}
+      url: ${{ steps.deploy.outputs.api_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ambiente según la rama
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            develop) echo "APP_ENV=dev"  >> "$GITHUB_ENV" ;;
+            qa)      echo "APP_ENV=qa"   >> "$GITHUB_ENV" ;;
+            main)    echo "APP_ENV=prod" >> "$GITHUB_ENV" ;;
+            *) echo "Rama sin ambiente: ${GITHUB_REF_NAME}" >&2; exit 1 ;;
+          esac
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Construir y publicar imagen
+        if: inputs.image_tag == ''
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          docker build -t "$IMAGE:$APP_ENV" -t "$IMAGE:$APP_ENV-$SHORT_SHA" backend
+          docker push "$IMAGE:$APP_ENV-$SHORT_SHA"
+          docker push "$IMAGE:$APP_ENV"
+
+      - name: Rollback a ${{ inputs.image_tag }}
+        if: inputs.image_tag != ''
+        run: |
+          MANIFEST="$(aws ecr batch-get-image --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="${{ inputs.image_tag }}" --query 'images[0].imageManifest' --output text)"
+          aws ecr put-image --repository-name "$ECR_REPOSITORY" --image-tag "$APP_ENV" --image-manifest "$MANIFEST" \
+            || echo "El tag $APP_ENV ya apunta a esa imagen"
+
+      - name: Desplegar en App Runner
+        id: deploy
+        run: |
+          SERVICE="observatorio-api-$APP_ENV"
+          ARN="$(aws apprunner list-services --query "ServiceSummaryList[?ServiceName=='$SERVICE'].ServiceArn | [0]" --output text)"
+          [ "$ARN" != "None" ] || { echo "No existe el servicio $SERVICE" >&2; exit 1; }
+          OP="$(aws apprunner start-deployment --service-arn "$ARN" --query OperationId --output text)"
+          echo "Operación $OP"
+          for i in $(seq 1 60); do
+            STATUS="$(aws apprunner list-operations --service-arn "$ARN" \
+              --query "OperationSummaryList[?Id=='$OP'].Status | [0]" --output text)"
+            echo "  $STATUS"
+            case "$STATUS" in
+              SUCCEEDED) break ;;
+              FAILED|ROLLBACK_SUCCEEDED|ROLLBACK_FAILED) echo "Despliegue fallido: $STATUS" >&2; exit 1 ;;
+            esac
+            sleep 15
+          done
+          [ "$STATUS" = "SUCCEEDED" ] || { echo "Tiempo de espera agotado" >&2; exit 1; }
+          URL="https://$(aws apprunner describe-service --service-arn "$ARN" --query Service.ServiceUrl --output text)"
+          echo "api_url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Pruebas de humo
+        run: ./scripts/smoke-test.sh "${{ steps.deploy.outputs.api_url }}" "${{ vars.FRONTEND_URL }}"
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "### Despliegue ${APP_ENV^^}"
+            echo "- Commit: \`${GITHUB_SHA::7}\`"
+            echo "- Imagen: \`${{ inputs.image_tag || format('{0}-{1}', env.APP_ENV, github.sha) }}\`"
+            echo "- API: ${{ steps.deploy.outputs.api_url }}"
+            echo "- Frontend: ${{ vars.FRONTEND_URL }}"
+          } >> "$GITHUB_STEP_SUMMARY"
